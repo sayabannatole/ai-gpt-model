@@ -2,11 +2,12 @@
 
 A tiny, local-first **context search model** for small websites.
 
-This project gives you a mini retrieval system (TF-IDF based) that:
+This project gives you a mini retrieval system (sentence-embedding based) that:
 
 1. Crawls a small website.
-2. Builds an index of page content.
-3. Lets you run context-based search queries against that index.
+2. Builds an index of section-level content chunks.
+3. Lets you run semantic context search queries against that index.
+4. Supports metadata filters for `docs`, `blog`, and `changelog` pages.
 
 ## Why this is useful
 
@@ -26,16 +27,23 @@ python -m src.context_search build https://example.com --max-pages 15 --out cont
 python -m src.context_search search "getting started api" --index context_index.json --top-k 5
 ```
 
+### 3) Filter by metadata tags
+
+```bash
+python -m src.context_search search "release notes" --index context_index.json --tags changelog
+```
+
 ## What is implemented
 
-- A mini retriever (`MiniContextModel`) with:
+- A mini semantic retriever (`MiniContextModel`) with:
   - Tokenization
-  - TF-IDF vector creation
+  - Local sentence embeddings
   - Cosine similarity ranking
 - A crawler (`crawl_site`) that:
   - Traverses same-domain links
-  - Extracts visible HTML text
-  - Builds `PageDocument` objects
+  - Extracts section-level chunks from heading/content boundaries
+  - Adds metadata tags (`docs`, `blog`, `changelog`) inferred from URL paths
+  - Builds `PageDocument` chunk objects
 - Save/load index as JSON for local testing.
 
 ## Run tests
@@ -43,9 +51,3 @@ python -m src.context_search search "getting started api" --index context_index.
 ```bash
 python -m unittest discover -s tests
 ```
-
-## Next upgrades
-
-- Add chunking per page section instead of whole page text.
-- Add metadata filters (docs/blog/changelog tags).
-- Replace TF-IDF with sentence embeddings when you need semantic search.

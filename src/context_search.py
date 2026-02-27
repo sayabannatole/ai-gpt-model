@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -14,16 +15,27 @@ from urllib.request import urlopen
 
 WORD_PATTERN = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]{1,}")
 SKIP_TAGS = {"script", "style", "noscript"}
+HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+CONTENT_TAGS = {"p", "li", "blockquote", "pre", "code", "td", "th", "section", "article", "main", "div"}
 
 
-class TextExtractor(HTMLParser):
-    """Extract visible text and links from an HTML page."""
+def normalize_vector(vec: List[float]) -> List[float]:
+    magnitude = math.sqrt(sum(value * value for value in vec))
+    if magnitude == 0.0:
+        return vec
+    return [value / magnitude for value in vec]
+
+
+class SectionExtractor(HTMLParser):
+    """Extract page links and chunkable sections based on heading boundaries."""
 
     def __init__(self) -> None:
         super().__init__()
-        self._text_parts: List[str] = []
         self._links: List[str] = []
         self._tag_stack: List[str] = []
+        self._current_heading: str = ""
+        self._current_lines: List[str] = []
+        self._sections: List[Tuple[str, str]] = []
 
     def handle_starttag(self, tag: str, attrs: Sequence[Tuple[str, str | None]]) -> None:
         self._tag_stack.append(tag)
@@ -39,13 +51,30 @@ class TextExtractor(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._tag_stack and self._tag_stack[-1] in SKIP_TAGS:
             return
-        text = data.strip()
-        if text:
-            self._text_parts.append(text)
+        text = " ".join(data.split())
+        if not text:
+            return
+
+        current_tag = self._tag_stack[-1] if self._tag_stack else ""
+        if current_tag in HEADING_TAGS:
+            self._flush_section()
+            self._current_heading = text
+            return
+
+        if current_tag in CONTENT_TAGS:
+            self._current_lines.append(text)
+
+    def _flush_section(self) -> None:
+        body = " ".join(self._current_lines).strip()
+        if body:
+            heading = self._current_heading or "Overview"
+            self._sections.append((heading, body))
+        self._current_lines = []
 
     @property
-    def text(self) -> str:
-        return " ".join(self._text_parts)
+    def sections(self) -> List[Tuple[str, str]]:
+        self._flush_section()
+        return self._sections
 
     @property
     def links(self) -> List[str]:
@@ -57,15 +86,16 @@ class PageDocument:
     url: str
     title: str
     content: str
+    section: str = "Overview"
+    tags: List[str] = field(default_factory=list)
 
 
 class MiniContextModel:
-    """A lightweight TF-IDF retriever for small websites."""
+    """A lightweight semantic retriever using local sentence embeddings."""
 
-    def __init__(self) -> None:
+    def __init__(self, embedding_dim: int = 128) -> None:
+        self.embedding_dim = embedding_dim
         self.documents: List[PageDocument] = []
-        self.vocabulary: Dict[str, int] = {}
-        self.idf: List[float] = []
         self.doc_vectors: List[List[float]] = []
 
     @staticmethod
@@ -81,71 +111,64 @@ class MiniContextModel:
             return 0.0
         return dot / (mag_a * mag_b)
 
+    def _token_embedding(self, token: str) -> List[float]:
+        values: List[float] = []
+        for idx in range(self.embedding_dim):
+            digest = hashlib.blake2b(f"{token}:{idx}".encode("utf-8"), digest_size=8).digest()
+            number = int.from_bytes(digest, byteorder="big", signed=False)
+            values.append((number / (2**64 - 1)) * 2 - 1)
+        return values
+
+    def embed_text(self, text: str) -> List[float]:
+        tokens = self.tokenize(text)
+        if not tokens:
+            return [0.0] * self.embedding_dim
+
+        accumulator = [0.0] * self.embedding_dim
+        for token in tokens:
+            token_vec = self._token_embedding(token)
+            for idx, value in enumerate(token_vec):
+                accumulator[idx] += value
+        averaged = [value / len(tokens) for value in accumulator]
+        return normalize_vector(averaged)
+
     def fit(self, documents: Iterable[PageDocument]) -> None:
         self.documents = list(documents)
-        term_freqs: List[Dict[str, int]] = []
-        doc_freq: Dict[str, int] = {}
+        self.doc_vectors = [
+            self.embed_text(f"{doc.title} {doc.section} {doc.content}") for doc in self.documents
+        ]
 
-        for doc in self.documents:
-            tf: Dict[str, int] = {}
-            terms = self.tokenize(f"{doc.title} {doc.content}")
-            for token in terms:
-                tf[token] = tf.get(token, 0) + 1
-            term_freqs.append(tf)
-            for token in tf:
-                doc_freq[token] = doc_freq.get(token, 0) + 1
-
-        self.vocabulary = {token: i for i, token in enumerate(sorted(doc_freq))}
-        total_docs = max(len(self.documents), 1)
-        self.idf = [0.0] * len(self.vocabulary)
-
-        for token, idx in self.vocabulary.items():
-            df = doc_freq[token]
-            self.idf[idx] = math.log((1 + total_docs) / (1 + df)) + 1.0
-
-        self.doc_vectors = [self._tfidf_vector(tf) for tf in term_freqs]
-
-    def _tfidf_vector(self, term_freq: Dict[str, int]) -> List[float]:
-        vec = [0.0] * len(self.vocabulary)
-        total_terms = sum(term_freq.values()) or 1
-        for token, count in term_freq.items():
-            idx = self.vocabulary.get(token)
-            if idx is None:
-                continue
-            tf = count / total_terms
-            vec[idx] = tf * self.idf[idx]
-        return vec
-
-    def search(self, query: str, top_k: int = 5) -> List[Tuple[PageDocument, float]]:
-        if not self.documents or not self.vocabulary:
+    def search(
+        self, query: str, top_k: int = 5, tags: Sequence[str] | None = None
+    ) -> List[Tuple[PageDocument, float]]:
+        if not self.documents:
             raise ValueError("Model is empty. Fit or load an index first.")
 
-        query_tf: Dict[str, int] = {}
-        for token in self.tokenize(query):
-            query_tf[token] = query_tf.get(token, 0) + 1
+        query_vec = self.embed_text(query)
+        tag_filter = {tag.lower() for tag in (tags or [])}
 
-        query_vec = self._tfidf_vector(query_tf)
-        scores = [
-            (doc, self._cosine_similarity(doc_vec, query_vec))
-            for doc, doc_vec in zip(self.documents, self.doc_vectors)
-        ]
+        scores = []
+        for doc, doc_vec in zip(self.documents, self.doc_vectors):
+            if tag_filter and not tag_filter.intersection({tag.lower() for tag in doc.tags}):
+                continue
+            score = self._cosine_similarity(doc_vec, query_vec)
+            scores.append((doc, score))
+
         scores.sort(key=lambda item: item[1], reverse=True)
         return scores[:top_k]
 
     def to_dict(self) -> Dict[str, object]:
         return {
+            "embedding_dim": self.embedding_dim,
             "documents": [asdict(doc) for doc in self.documents],
-            "vocabulary": self.vocabulary,
-            "idf": self.idf,
             "doc_vectors": self.doc_vectors,
         }
 
     @classmethod
     def from_dict(cls, payload: Dict[str, object]) -> "MiniContextModel":
-        model = cls()
+        embedding_dim = int(payload.get("embedding_dim", 128))
+        model = cls(embedding_dim=embedding_dim)
         model.documents = [PageDocument(**doc) for doc in payload["documents"]]
-        model.vocabulary = {str(k): int(v) for k, v in payload["vocabulary"].items()}
-        model.idf = [float(v) for v in payload["idf"]]
         model.doc_vectors = [[float(x) for x in vec] for vec in payload["doc_vectors"]]
         return model
 
@@ -156,6 +179,15 @@ class MiniContextModel:
     def load(cls, path: str | Path) -> "MiniContextModel":
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls.from_dict(payload)
+
+
+def infer_tags(url: str) -> List[str]:
+    lowered = url.lower()
+    tags = []
+    for candidate in ("docs", "blog", "changelog"):
+        if f"/{candidate}" in lowered or lowered.endswith(candidate):
+            tags.append(candidate)
+    return tags
 
 
 def crawl_site(base_url: str, max_pages: int = 20) -> List[PageDocument]:
@@ -178,15 +210,27 @@ def crawl_site(base_url: str, max_pages: int = 20) -> List[PageDocument]:
         except Exception:
             continue
 
-        parser = TextExtractor()
+        parser = SectionExtractor()
         parser.feed(html)
-        text = parser.text
-        if not text:
+        sections = parser.sections
+        if not sections:
             continue
 
         title_match = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
         title = title_match.group(1).strip() if title_match else url
-        docs.append(PageDocument(url=url, title=title, content=text))
+        page_tags = infer_tags(url)
+        for section_title, section_text in sections:
+            docs.append(
+                PageDocument(
+                    url=url,
+                    title=title,
+                    section=section_title,
+                    content=section_text,
+                    tags=page_tags,
+                )
+            )
+            if len(docs) >= max_pages:
+                break
 
         for link in parser.links:
             absolute = urljoin(url, link)
@@ -214,6 +258,11 @@ def cli() -> None:
     search_parser.add_argument("query", help="Search query")
     search_parser.add_argument("--index", default="context_index.json")
     search_parser.add_argument("--top-k", type=int, default=5)
+    search_parser.add_argument(
+        "--tags",
+        default="",
+        help="Comma-separated metadata filters (docs,blog,changelog)",
+    )
 
     args = parser.parse_args()
 
@@ -222,11 +271,14 @@ def cli() -> None:
         model = MiniContextModel()
         model.fit(docs)
         model.save(args.out)
-        print(f"Indexed {len(docs)} pages into {args.out}")
+        print(f"Indexed {len(docs)} sections into {args.out}")
     else:
         model = MiniContextModel.load(args.index)
-        for doc, score in model.search(args.query, top_k=args.top_k):
-            print(f"[{score:.3f}] {doc.title} -> {doc.url}")
+        tags = [tag.strip() for tag in args.tags.split(",") if tag.strip()]
+        for doc, score in model.search(args.query, top_k=args.top_k, tags=tags):
+            print(
+                f"[{score:.3f}] {doc.title} ({doc.section}) [{','.join(doc.tags) or 'untagged'}] -> {doc.url}"
+            )
 
 
 if __name__ == "__main__":
